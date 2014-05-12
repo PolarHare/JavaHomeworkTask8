@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 
 /**
@@ -12,7 +13,7 @@ import java.nio.ByteBuffer;
 public class HelloUDPClient {
 
     private static final String USAGE = "Usage:\n   HelloUDPClient [host] [serverPort] [taskPrefix]";
-    private static final int THREADS_COUNT = 10;
+    private static final int THREADS_COUNT = 1;
 
     public static void main(String[] args) {
         if (args.length < 3) {
@@ -25,8 +26,8 @@ public class HelloUDPClient {
         if (prefix.getBytes().length > Utils.MAX_BUFFER_SIZE / 2) {
             throw new IllegalArgumentException("TaskPrefix is too long!");
         }
-        for (int i = 0; i < THREADS_COUNT; i++) {
-            new Thread(new ClientSender(host, port, prefix, i)).start();
+        for (int i = 1; i <= THREADS_COUNT; i++) {
+            new Thread(new ClientSender(host, port, prefix, i), "Client #" + i).start();
         }
     }
 
@@ -46,13 +47,12 @@ public class HelloUDPClient {
 
         @Override
         public void run() {
-            int requestId = 0;
+            int requestId = 1;
             try (DatagramSocket socket = new DatagramSocket()) {
-                socket.bind(new InetSocketAddress(host, port));
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
                         String result = executeRequest(requestId, socket);
-                        log("result for  \t" + requestId + ": " + result);
+                        log("result for requestId =\t" + requestId + ": " + result);
                         requestId++;
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -67,7 +67,7 @@ public class HelloUDPClient {
             String request = generateRequest(requestId);
             byte[] requestBytes = request.getBytes();
 
-            ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + requestBytes.length);
+            ByteBuffer buffer = ByteBuffer.allocate(4 * 4 + requestBytes.length);
             buffer.putInt(Utils.COMMAND_NEW_MESSAGE);
             buffer.putInt(clientId);
             buffer.putInt(requestId);
@@ -76,15 +76,21 @@ public class HelloUDPClient {
             byte[] data = buffer.array();
 
             DatagramPacket packet = new DatagramPacket(data, data.length);
+            packet.setSocketAddress(new InetSocketAddress(host, port));
+            int attemptsNum = 0;
             while (!Thread.currentThread().isInterrupted()) {
                 socket.send(packet);
+                attemptsNum++;
                 try {
                     long timeOfSending = System.currentTimeMillis();
-                    log("package sent \t" + requestId);
+                    log("package sent requestId =\t" + requestId
+                            + (attemptsNum == 1 ? "" : "\tattempt #" + attemptsNum));
                     while (!Thread.currentThread().isInterrupted()) {
                         long timeout = Utils.TIMEOUT - Utils.getPassedTimeFrom(timeOfSending);
                         ServerResponse response = listenForResponse(socket, Math.max(0, timeout));
-
+                        if (response == null) {
+                            break;
+                        }
                         confirmResult(socket, response);
 
                         if (response.getRequestId() == requestId) {
@@ -102,12 +108,13 @@ public class HelloUDPClient {
         }
 
         private void confirmResult(DatagramSocket socket, ServerResponse response) throws IOException {
-            byte[] data;ByteBuffer buff = ByteBuffer.allocate(4 + 4 + 4);
+            byte[] data;
+            ByteBuffer buff = ByteBuffer.allocate(4 + 4 + 4);
             buff.putInt(Utils.COMMAND_GOT_RESULT);
             buff.putInt(clientId);
             buff.putInt(response.getRequestId());
             data = buff.array();
-            socket.send(new DatagramPacket(data, data.length));
+            socket.send(new DatagramPacket(data, data.length, new InetSocketAddress(host, port)));
         }
 
         private ServerResponse listenForResponse(DatagramSocket socket, long timeout) throws InterruptedException {
@@ -124,12 +131,14 @@ public class HelloUDPClient {
                     int requestId = buffer.getInt();
                     int dataSize = buffer.getInt();
                     byte[] data = new byte[dataSize];
-                    buffer.get(data, 4 + 4 + 4 + 4, dataSize);
+                    buffer.get(data, 0, dataSize);
                     String result = new String(data);
                     return new ServerResponse(result, requestId);
                 } else {
                     throw new IllegalStateException("Unsupported command type = " + commandType);
                 }
+            } catch (SocketTimeoutException e) {
+                return null;
             } catch (IOException e) {
                 throw new IllegalStateException(e);
             }
