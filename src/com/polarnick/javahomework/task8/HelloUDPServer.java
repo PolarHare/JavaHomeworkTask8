@@ -1,14 +1,20 @@
 package com.polarnick.javahomework.task8;
 
+import com.googlecode.concurrentlinkedhashmap.ConcurrentLinkedHashMap;
+
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.SocketException;
-import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @author Polyarnyi Nikolay
@@ -16,10 +22,16 @@ import java.util.Random;
 public class HelloUDPServer {
 
     private static final String USAGE = "USAGE:\n   HelloUDPServer [serverPort]";
-    private static final int THREADS_COUNT = 1;
-    private static final int MAX_TASK_RESPONSE_DELAY = 2391;
+    private static final int THREADS_COUNT = 17;
+    private static final int MAX_TASK_EXECUTION_TIME = 23910;
+    private static final int CACHE_SIZE = 1024;
 
     private final int port;
+
+    private DatagramSocket socket;
+    private BlockingQueue<DatagramPacket> newMessagesQueue;
+    private Map<Integer, BlockingQueue<DatagramPacket>> newPacketsByClientId;
+    private ConcurrentLinkedHashMap<String, String> responseCache;
 
     public static void main(String[] args) throws SocketException {
         if (args.length < 1) {
@@ -37,40 +49,80 @@ public class HelloUDPServer {
 
     private void start() {
         List<Thread> listeners;
-        try (DatagramSocket socket = new DatagramSocket(port)) {
+        try {
+            responseCache = new ConcurrentLinkedHashMap.Builder<String, String>()
+                    .maximumWeightedCapacity(CACHE_SIZE).build();
+            newMessagesQueue = new LinkedBlockingQueue<>();
+            newPacketsByClientId = new ConcurrentHashMap<>();
+            socket = new DatagramSocket(port);
             listeners = new ArrayList<>(THREADS_COUNT);
             for (int i = 0; i < THREADS_COUNT; i++) {
-                Thread listener = new Thread(new ServerListener(socket, i), "Server #" + i);
+                Thread listener = new Thread(new ServerListener(i), "Server #" + i);
                 listener.start();
                 listeners.add(listener);
+            }
+            while (!Thread.currentThread().isInterrupted()) {
+                DatagramPacket packet = new DatagramPacket(new byte[Utils.MAX_BUFFER_SIZE], Utils.MAX_BUFFER_SIZE);
+                socket.receive(packet);
+                registerPacket(packet);
+            }
+            for (Thread listener : listeners) {
+                listener.interrupt();
             }
             for (Thread listener : listeners) {
                 listener.join();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        } catch (SocketException e) {
+        } catch (IOException e) {
             throw new IllegalStateException(e);
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
         }
+    }
+
+    private void registerPacket(DatagramPacket packet) {
+        ByteBuffer buff = ByteBuffer.wrap(packet.getData(), packet.getOffset(), packet.getLength());
+        int commandType = buff.getInt();
+        int clientId = buff.getInt();
+        if (commandType == Utils.COMMAND_NEW_MESSAGE) {
+            if (!newPacketsByClientId.containsKey(clientId)) {
+                newPacketsByClientId.put(clientId, new LinkedBlockingQueue<>());
+            }
+            newMessagesQueue.add(packet);
+        } else {
+            newPacketsByClientId.get(clientId).add(packet);
+        }
+    }
+
+    private DatagramPacket acceptNewClient() throws IOException, InterruptedException {
+        return newMessagesQueue.take();
+    }
+
+    private DatagramPacket receiveDatagramPacket(int clientId, long timeout) throws IOException, InterruptedException {
+        return newPacketsByClientId.get(clientId).poll(timeout, TimeUnit.MILLISECONDS);
     }
 
     private class ServerListener implements Runnable {
 
-        private final DatagramSocket socket;
         private final int id;
 
-        public ServerListener(DatagramSocket socket, int id) {
-            this.socket = socket;
+        public ServerListener(int id) {
             this.id = id;
         }
 
         @Override
         public void run() {
             try {
-                DatagramPacket packet = new DatagramPacket(new byte[Utils.MAX_BUFFER_SIZE], Utils.MAX_BUFFER_SIZE);
                 while (!Thread.currentThread().isInterrupted()) {
-                    socket.receive(packet);
-                    handle(packet);
+                    try {
+                        DatagramPacket packet = acceptNewClient();
+                        handle(packet);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             } catch (IOException e) {
                 throw new IllegalStateException(e);
@@ -88,7 +140,7 @@ public class HelloUDPServer {
                 buff.get(data, 0, dataLength);
                 String message = new String(data);
                 log("got message {clientId =\t" + clientId + ", requestId =\t" + requestId + ", request =\t'" + message + "'}");
-                processRequest(clientId, requestId, message, packet, socket);
+                processRequest(clientId, requestId, message, packet);
             } else if (commandType == Utils.COMMAND_GOT_RESULT) {
                 int clientId = buff.getInt();
                 int requestId = buff.getInt();
@@ -98,13 +150,13 @@ public class HelloUDPServer {
             }
         }
 
-        private void processRequest(int clientId, int requestId, String message, DatagramPacket packet, DatagramSocket socket) throws IOException {
+        private void processRequest(int clientId, int requestId, String message, DatagramPacket packet) throws IOException {
             String response = generateResponse(message);
             byte[] responseBytes = response.getBytes();
             boolean clientGotTheResult = false;
             int attemptsNum = 0;
             while (!clientGotTheResult && !Thread.currentThread().isInterrupted()) {
-                sendResponse(clientId, requestId, packet, socket, responseBytes);
+                sendResponse(clientId, requestId, packet, responseBytes);
                 attemptsNum++;
                 log("package sent {clientId =\t" + clientId + ", requestId =\t" + requestId + ", response =\t'" + response + "'}"
                         + (attemptsNum == 1 ? "" : " attempt #" + attemptsNum));
@@ -114,9 +166,10 @@ public class HelloUDPServer {
                     long timeout = Utils.TIMEOUT - Utils.getPassedTimeFrom(timeOfSending);
 
                     try {
-                        socket.setSoTimeout((int) timeout);
-                        DatagramPacket packetFromClient = new DatagramPacket(new byte[Utils.MAX_BUFFER_SIZE], Utils.MAX_BUFFER_SIZE);
-                        socket.receive(packetFromClient);
+                        DatagramPacket packetFromClient = receiveDatagramPacket(clientId, timeout);
+                        if (packetFromClient == null) {//timeout
+                            break;
+                        }
 
                         ByteBuffer buff = ByteBuffer.wrap(packetFromClient.getData(), packetFromClient.getOffset(), packetFromClient.getLength());
                         int commandType = buff.getInt();
@@ -144,8 +197,8 @@ public class HelloUDPServer {
                         } else {
                             throw new IllegalStateException("Unexpected command type = " + commandType);
                         }
-                    } catch (SocketTimeoutException e) {
-                        break;
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                     }
 
                     if (Utils.getPassedTimeFrom(timeOfSending) > Utils.TIMEOUT) {
@@ -155,7 +208,7 @@ public class HelloUDPServer {
             }
         }
 
-        private void sendResponse(int clientId, int requestId, DatagramPacket packet, DatagramSocket socket, byte[] responseBytes) throws IOException {
+        private void sendResponse(int clientId, int requestId, DatagramPacket packet, byte[] responseBytes) throws IOException {
             ByteBuffer buff = ByteBuffer.allocate(4 * 4 + responseBytes.length);
             buff.putInt(Utils.COMMAND_RESULT);
             buff.putInt(clientId);
@@ -177,9 +230,15 @@ public class HelloUDPServer {
         }
 
         private String generateResponse(String request) {
-            Random r = new Random();
-            Utils.sleepWithThreadInterrupting(r.nextInt(MAX_TASK_RESPONSE_DELAY));
-            return "Hello, " + request;
+            String result = responseCache.get(request);
+            if (result == null) {
+                Random r = new Random();
+                int timeOfPureExecuting = r.nextInt(MAX_TASK_EXECUTION_TIME);
+                Utils.sleepWithThreadInterrupting(timeOfPureExecuting);
+                result = "Hello, " + request + " (time of executing = " + timeOfPureExecuting + " ms)";
+                responseCache.put(request, result);
+            }
+            return result;
         }
     }
 

@@ -13,7 +13,7 @@ import java.nio.ByteBuffer;
 public class HelloUDPClient {
 
     private static final String USAGE = "Usage:\n   HelloUDPClient [host] [serverPort] [taskPrefix]";
-    private static final int THREADS_COUNT = 1;
+    private static final int THREADS_COUNT = 10;
 
     public static void main(String[] args) {
         if (args.length < 3) {
@@ -45,15 +45,24 @@ public class HelloUDPClient {
             this.clientId = clientId;
         }
 
+        private int nextRequestId = 1;
+
+        private int getNextRequestId() {
+            int id = nextRequestId;
+            ++nextRequestId;
+            return id;
+        }
+
         @Override
         public void run() {
-            int requestId = 1;
             try (DatagramSocket socket = new DatagramSocket()) {
                 while (!Thread.currentThread().isInterrupted()) {
                     try {
+                        long start = System.currentTimeMillis();
+                        int requestId = getNextRequestId();
                         String result = executeRequest(requestId, socket);
-                        log("result for requestId =\t" + requestId + ": " + result);
-                        requestId++;
+                        long elapsed = System.currentTimeMillis() - start;
+                        log("(response time = " + elapsed + " ms) result for requestId =\t" + requestId + ": " + result);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
